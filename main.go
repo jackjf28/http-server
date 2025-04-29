@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,18 +28,14 @@ func scanForIPv4Address() ([]byte, error) {
 		return []byte{}, err
 	}
 	for _, i := range interfaces {
-		//		fmt.Printf("Found interface: %v\n", i.Name)
 		addrs, err := i.Addrs()
 		if err != nil {
 			continue
 		}
 		for _, addr := range addrs {
-			//			fmt.Printf("  Found address: %v\n", addr.String())
-			//			fmt.Printf("	on network: %v\n", addr.Network())
 			if ipAddr, ok := addr.(*net.IPNet); ok {
 				ip := ipAddr.IP
 				if !ip.IsLoopback() && ip.To4() != nil {
-					//fmt.Printf("Using %v.\n", addr.String())
 					return ip.To4(), err
 				}
 			}
@@ -46,59 +44,115 @@ func scanForIPv4Address() ([]byte, error) {
 	return []byte{}, nil
 }
 
-func asset_handler(path string) ([]byte, error) {
+func sendAsset(fd int, path string) error {
 	ext := filepath.Ext(path)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Fatalf("Failed to read file at %v: %v\n", path, err)
+		body := fmt.Sprintf("ERROR: Failed to read file at %v\n", path)
+		sendMessage("500", body, "close", fd)
+		return errors.New(body)
 	}
 	ctype, ok := mimeTypes[ext]
 	if !ok {
-		log.Printf("Extension: %v not recognized.\n", err)
+		log.Printf("INFO: Extension: %v not recognized.\n", err)
 		ctype = "application/octet-stream"
 	}
+	data_len := strconv.Itoa(len(data))
+	timestamp := time.Now().Format(time.RFC1123)
 	var b bytes.Buffer
 	b.Write([]byte("HTTP/1.1 200 OK\r\n"))
 	b.Write([]byte("Server: Pop! OS\r\n"))
-	b.Write([]byte(fmt.Sprintf("Date: %v\r\n", time.Now())))
-	b.Write([]byte(fmt.Sprintf("Content-Length: %d\r\n", len(data))))
-	b.Write([]byte(fmt.Sprintf("Content-Type: %s\r\n", ctype)))
-	b.Write([]byte("Cache-Control: no-store\n"))
+	b.Write([]byte("Date: " + timestamp + "\r\n"))
+	b.Write([]byte("Content-Length: " + data_len + "\r\n"))
+	b.Write([]byte("Content-Type: " + ctype + "\r\n"))
+	b.Write([]byte("Cache-Control: no-store\r\n"))
+	b.Write([]byte("Connection: close\r\n"))
 	b.Write([]byte("\r\n"))
 	b.Write(data)
-	return b.Bytes(), nil
+	b.Write([]byte("\r\n"))
+	_, msg_err := syscall.Write(fd, b.Bytes())
+	if msg_err != nil {
+		if msg_err == syscall.EPIPE {
+			return errors.New("Broken pipe: client disconnected before data was sent.")
+		} else {
+			return msg_err
+		}
+	}
+	return nil
+}
+
+func sendMessage(status_code string, body string, conn_status string, client_fd int) error {
+	var b bytes.Buffer
+	content_len := strconv.Itoa(len(body))
+	b.Write([]byte("HTTP/1.1 " + status_code + "\r\n"))
+	b.Write([]byte("Content-Type: text/plain\r\n"))
+	b.Write([]byte("Content-Length: " + content_len + "\r\n"))
+	b.Write([]byte("Connection: " + conn_status + "\r\n"))
+	b.Write([]byte("\r\n"))
+	b.Write([]byte(body + "\r\n"))
+
+	_, err := syscall.Write(client_fd, b.Bytes())
+	if err != nil {
+		if err == syscall.EPIPE {
+			return errors.New("Broken pipe: client disconnected before data was sent.")
+		} else {
+			return err
+		}
+	}
+	return nil
+}
+
+func readRequest(fd int, recv_buf []byte, n int) error {
+
+	rawRequest := string(recv_buf[:n])
+	lines := strings.Split(rawRequest, "\r\n")
+
+	for _, line := range lines {
+		switch line {
+		case "GET / HTTP/1.1":
+			log.Println("INFO: " + line)
+			return sendAsset(fd, "./public/index.html")
+		case "GET /favicon.ico HTTP/1.1":
+			log.Println("INFO: " + line)
+			return sendAsset(fd, "./favicon.ico")
+		case "GET /css/style.css HTTP/1.1":
+			log.Println("INFO: " + line)
+			return sendAsset(fd, "./public/css/style.css")
+		default:
+			log.Println("ERROR: " + line)
+			sendMessage("404 NOT FOUND", "Page not found.", "close", fd)
+			return errors.New("Page not found.")
+		}
+	}
+	return nil
 }
 
 func clientHandler(fd int) {
 	defer syscall.Close(fd)
 	recv_buf := make([]byte, 1024)
-	// TODO: Handle client disconnects!!!
-	n, _, recv_err := syscall.Recvfrom(fd, recv_buf, 0)
-	if recv_err != nil {
-		log.Fatalf("Recvfrom: %v\n", recv_err)
-	}
-	rawRequest := string(recv_buf[:n])
+	for {
+		n, _, recv_err := syscall.Recvfrom(fd, recv_buf, 0)
+		if recv_err != nil {
+			log.Printf("ERROR: Recvfrom: %v\n", recv_err)
+		}
 
-	lines := strings.Split(rawRequest, "\r\n")
-	fmt.Printf("Request Line: %v\n", lines[0])
-	parts := strings.Split(lines[0], " ")
-	if len(parts) > 2 && parts[0] == "GET" {
-		var data []byte
-		path := parts[1]
-		filename := strings.TrimPrefix(path, "/")
-		fmt.Printf("Requested file: %s\n", filename)
-		if strings.HasSuffix(filename, "png") || strings.HasSuffix(filename, "ico") {
-			data, _ = asset_handler(filename)
-		} else if strings.HasSuffix(filename, "css") {
-			data, _ = asset_handler("./public/css/style.css")
-		} else if len(filename) == 0 {
-			data, _ = asset_handler("./public/index.html")
+		if n == 0 {
+			body := "Connection closed by peer."
+			sendMessage("400", body, "close", fd)
+			break
+		} else if n < 0 {
+			body := "An error occurred."
+			sendMessage("400", body, "close", fd)
+			break
+		} else {
+			err := readRequest(fd, recv_buf, n)
+			if err != nil {
+				log.Printf("ERROR: %v\n", err)
+				body := "An error occurred while reading the request. Closing connection"
+				sendMessage("400", body, "close", fd)
+				break
+			}
 		}
-		sentBytes, err := syscall.Write(fd, data)
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Printf("Sent bytes: %d\n", sentBytes)
 	}
 }
 
@@ -126,37 +180,34 @@ func main() {
 
 	err = syscall.Bind(s, &sa)
 	if err != nil {
-		log.Fatal("Error binding socket: ", err)
+		log.Fatal("ERROR: Error binding socket: ", err)
 	}
 
-	fmt.Printf("listening on %v:%d...\n", net.IP(sa.Addr[:]).String(), PORT)
+	log.Printf("INFO: listening on %v:%d...\n", net.IP(sa.Addr[:]).String(), PORT)
 	err = syscall.Listen(s, 10)
 	if err != nil {
-		log.Fatalf("Error listening on socket %d: %e", s, err)
+		log.Fatalf("ERROR: Error listening on socket %d: %e", s, err)
 	}
 
 	for {
 		newfd, their_addr, err := syscall.Accept(s)
-		defer syscall.Close(newfd)
 		if err != nil {
 			log.Fatal(err)
 		}
-
-		fmt.Printf("A new fd: %d!\n", newfd)
 		switch their_addr := their_addr.(type) {
 		case *syscall.SockaddrInet4:
-			fmt.Printf("Client Connected: IPv4: %v:%d\n",
+			fmt.Printf("INFO: Client Connected: IPv4: %v:%d\n",
 				net.IP(their_addr.Addr[:]).String(),
 				their_addr.Port)
 			// TODO: call client handler here
-			clientHandler(newfd)
+			go clientHandler(newfd)
 		case *syscall.SockaddrInet6:
-			fmt.Printf("Client Connected: IPv6(not supported): %v:%d\n",
+			fmt.Printf("INFO: Client Connected: IPv6(not supported): %v:%d\n",
 				net.IP(their_addr.Addr[:]).String(),
 				their_addr.Port)
 			continue
 		default:
-			fmt.Printf("Unrecognized address type. %t\n", their_addr)
+			fmt.Printf("INFO: Unrecognized address type. %t\n", their_addr)
 			continue
 		}
 	}
