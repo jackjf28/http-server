@@ -1,0 +1,9 @@
+# Ignore Go build outputs
+*.exe
+*.exe~
+*.out
+*.test
+
+# Ignore specific named binaries if you know them
+/http-server
+/http-server.exe
